@@ -6,6 +6,7 @@ Expected type errors are marked `# pyright: ignore[rule]`. With
 `reportUnnecessaryTypeIgnoreComment` enabled, pyright fails if a marked line is
 *not* an error, so the file checks cleanly only when the errors are exactly these.
 """
+# pyright: reportUnnecessaryTypeIgnoreComment=true
 
 import operator
 from typing import Any
@@ -16,7 +17,12 @@ import pytest
 import torch
 
 from ttensor import (
+    Concatenated,
     Dim,
+    Flattened,
+    Indexed,
+    Permuted,
+    Reshaped,
     TTensor,
     UnknownShape,
     cat,
@@ -47,6 +53,9 @@ F231 = TTensor[Dim[L[2], L[3], L[1]], Cpu, float]
 B23 = TTensor[Dim[L[2], L[3]], Cpu, bool]
 I23 = TTensor[Dim[L[2], L[3]], Cpu, int]
 I34 = TTensor[Dim[L[3], L[4]], Cpu, int]
+FLAT234 = TTensor[Dim[Flattened[L[2], L[3], L[4]]], Cpu, float]
+R23 = TTensor[Reshaped[Dim[L[2], L[3]]], Cpu, float]
+R234 = TTensor[Reshaped[Dim[L[2], L[3], L[4]]], Cpu, float]
 
 
 def pos(*shape: int) -> torch.Tensor:
@@ -255,8 +264,8 @@ def test_view_reshape() -> None:
     same(a.view(6, 4), x.view(6, 4))
     same(a.view((6, -1)), x.view((6, -1)))
     same(a.reshape(6, 4), x.reshape(6, 4))
-    assert_type(a.view(6, 4), Unk)
-    assert_type(a.reshape(6, 4), Unk)
+    assert_type(a.view(6, 4), R234)
+    assert_type(a.reshape(6, 4), R234)
     same(a.view_as(b), x.view_as(y))
     same(a.reshape_as(b), x.reshape_as(y))
     assert_type(a.view_as(b), F64)
@@ -274,8 +283,8 @@ def test_flatten_expand_permute() -> None:
     same(f.expand(2, 3), e.expand(2, 3))
     same(f.expand_as(F23.wrap(torch.randn(2, 3))), e.expand_as(torch.randn(2, 3)))
     same(f.repeat(2, 1), e.repeat(2, 1))
-    assert_type(a.flatten(), Unk)
-    assert_type(a.permute(2, 0, 1), Unk)
+    assert_type(a.flatten(), TTensor[Dim[Flattened[L[2], L[3], L[4]]], Cpu, float])
+    assert_type(a.permute(2, 0, 1), TTensor[Permuted[Dim[L[2], L[3], L[4]]], Cpu, float])
     assert_type(f.expand(2, 3), Unk)
     assert_type(f.repeat(2, 1), Unk)
 
@@ -325,7 +334,7 @@ def test_indexing() -> None:
     same(a[0], x[0])
     same(a[:, 1:], x[:, 1:])
     same(a[a > 0], x[x > 0])
-    assert_type(a[0], Unk)
+    assert_type(a[0], TTensor[Indexed[Dim[L[2], L[3], L[4]]], Cpu, float])
 
 
 def test_chunk_split_unbind() -> None:
@@ -348,6 +357,94 @@ def test_cat_stack() -> None:
     same(stack([a, b], dim=1), torch.stack([x, y], dim=1))
     assert_type(cat([a, b]), Unk)
     assert_type(stack([a, b]), Unk)
+
+
+# --- operation records -----------------------------------------------------
+
+
+def test_flatten_records_dims() -> None:
+    x, y = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
+    a, b = F234.wrap(x), F234.wrap(y)
+
+    same(a.flatten(), x.flatten())
+    assert_type(a.flatten(), FLAT234)
+    same(a.flatten(1), x.flatten(1))
+    assert_type(a.flatten(1), TTensor[Dim[L[2], Flattened[L[3], L[4]]], Cpu, float])
+    same(a.flatten() + b.flatten(), x.flatten() + y.flatten())  # same record, so same shape
+    assert_type(a.flatten() + b.flatten(), FLAT234)
+
+
+def test_flatten_edge_ranks() -> None:
+    v, s, m = torch.randn(4), torch.tensor(1.5), torch.randn(2, 3)
+    va = TTensor[Dim[L[4]], Cpu, float].wrap(v)
+    sa, ma = F0.wrap(s), F23.wrap(m)
+
+    same(va.flatten(), v.flatten())
+    assert_type(va.flatten(), TTensor[Dim[L[4]], Cpu, float])  # nothing to record
+    same(sa.flatten(), s.flatten())
+    assert_type(sa.flatten(), TTensor[Dim[L[1]], Cpu, float])
+    same(ma.flatten(1), m.flatten(1))
+    assert_type(ma.flatten(1), F23)
+    same(ma.flatten(0, 1), m.flatten(0, 1))
+    assert_type(ma.flatten(0, 1), Unk)  # other ranges are not tracked
+
+
+def test_cat_records_dim() -> None:
+    x, y = torch.randn(2, 3), torch.randn(2, 3)
+    a, b = F23.wrap(x), F23.wrap(y)
+
+    same(cat((a, b)), torch.cat((x, y)))
+    assert_type(cat((a, b)), TTensor[Dim[Concatenated[L[2], L[2]], L[3]], Cpu, float])
+    same(cat((a, b), dim=-1), torch.cat((x, y), dim=-1))
+    assert_type(cat((a, b), dim=-1), TTensor[Dim[L[2], Concatenated[L[3], L[3]]], Cpu, float])
+    same(cat([a, b]), torch.cat([x, y]))  # a list has no per-element types
+    assert_type(cat([a, b]), Unk)
+
+
+def test_shape_records_and_depth_cap() -> None:
+    x = torch.randn(2, 3, 4)
+    a = F234.wrap(x)
+    expected = x.view(6, 4).permute(1, 0)[0]
+
+    r = a.view(6, 4)
+    assert_type(r, R234)
+    p = r.permute(1, 0)
+    assert_type(p, TTensor[Permuted[Reshaped[Dim[L[2], L[3], L[4]]]], Cpu, float])
+    i = p[0]  # a third record would exceed two levels, so the record restarts
+    same(i, expected)
+    assert_type(i, TTensor[Indexed[Any], Cpu, float])
+    same(i.reshape(2, 3), expected.reshape(2, 3))
+    assert_type(i.reshape(2, 3), TTensor[Reshaped[Any], Cpu, float])  # and stays at one level
+
+
+def test_record_shaped_tensors_compose_with_elementwise_ops() -> None:
+    x, z = torch.randn(2, 3, 4), torch.randn(6, 4)
+    a, c = F234.wrap(x), F64.wrap(z)
+    r, expected = a.view(6, 4), x.view(6, 4)
+
+    same(r + r, expected + expected)
+    assert_type(r + r, R234)
+    same(r.exp(), expected.exp())
+    assert_type(r.exp(), R234)
+    same(r.sum(), expected.sum())
+    assert_type(r.sum(), F0)
+    same(r + c, expected + z)  # a different shape type: falls back to unknown
+    assert_type(r + c, Unk)
+
+
+def test_record_shaped_tensors_do_not_match_shape_patterns() -> None:
+    # Known limitation: TShape is invariant, so Reshaped[...] never matches Dim[...].
+    x, y = torch.randn(2, 3, 4), torch.randn(4, 5)
+    a, w = F234.wrap(x), F45.wrap(y)
+
+    same(a.view(6, 4) @ w, x.view(6, 4) @ y)  # pyright: ignore[reportOperatorIssue]
+    same(a.view(6, 4).t(), x.view(6, 4).t())  # pyright: ignore[reportAttributeAccessIssue]
+
+    def takes_unspecified(t: TTensor) -> None: ...
+
+    takes_unspecified(a)
+    takes_unspecified(a.flatten())  # dim-level records are fine
+    takes_unspecified(a.view(6, 4))  # pyright: ignore[reportArgumentType]
 
 
 # --- construction ----------------------------------------------------------
@@ -501,7 +598,7 @@ def test_device_mismatch_is_static_error() -> None:
         assert_type(a.to("cuda"), TTensor[Dim[L[2], L[3]], L["cuda"], float])
         _ = a @ b.cuda()  # pyright: ignore[reportOperatorIssue]
         _ = a + a.cuda()  # pyright: ignore[reportOperatorIssue]
-        _ = cat([a, a.cuda()])  # pyright: ignore[reportArgumentType]
+        _ = cat([a, a.cuda()])  # pyright: ignore[reportCallIssue, reportArgumentType]
 
 
 # --- known gaps: torch raises, pyright does not (shapes fall back to unknown) ---
@@ -524,7 +621,7 @@ def test_view_numel_mismatch_is_not_caught_statically() -> None:
     with pytest.raises(RuntimeError):
         _ = x.view(5, 5)
     with pytest.raises(RuntimeError):
-        assert_type(a.view(5, 5), Unk)
+        assert_type(a.view(5, 5), R23)
 
 
 # --- intentional divergence: TTensor is stricter than torch ----------------
@@ -536,4 +633,4 @@ def test_dtype_promotion_is_a_static_error() -> None:
 
     assert (x + y).dtype == torch.float32  # torch promotes int to float
     same(a + b, x + y)  # pyright: ignore[reportOperatorIssue]
-    same(cat([a, b]), torch.cat([x, y]))  # pyright: ignore[reportArgumentType]
+    same(cat([a, b]), torch.cat([x, y]))  # pyright: ignore[reportCallIssue, reportArgumentType]
