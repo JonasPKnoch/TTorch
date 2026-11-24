@@ -13,7 +13,7 @@ a: A = A()
 
 a_s = a
 n = 2 + 2
-for i in range(n):
+for i in range(5):
     a_s = suc(a_s)
 
 reveal_type(a_s)
